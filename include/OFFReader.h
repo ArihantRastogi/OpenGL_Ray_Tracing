@@ -26,7 +26,7 @@ OffModel* readOffFile(char * OffFile) {
 	FILE * input;
 	char type[3]; 
 	int noEdges;
-	int i,j;
+	int i, j;
 	float x,y,z;
 	int n, v;
 	int nv, np;
@@ -101,7 +101,7 @@ OffModel* readOffFile(char * OffFile) {
 
 int FreeOffModel(OffModel *model)
 {
-	int i,j;
+	int i;
 	if( model == NULL )
 		return 0;
 	free(model->vertices);
