@@ -30,6 +30,12 @@ struct Object {
 uniform Object objects[MAX_OBJECTS];
 uniform int numObjects;
 
+// Mesh data stored in texture
+uniform sampler2D meshDataTexture;
+uniform int numTriangles;
+uniform int meshObjectIndex; // Index of the mesh object in the objects array
+uniform int meshTextureSize;
+
 // Light properties
 #define MAX_LIGHTS 4
 struct Light {
@@ -48,6 +54,14 @@ struct Ray {
     vec3 direction;
 };
 
+// Triangle structure for Möller-Trumbore algorithm
+struct Triangle {
+    vec3 v0;
+    vec3 v1;
+    vec3 v2;
+    vec3 normal;
+};
+
 // Hit information
 struct HitInfo {
     bool hit;
@@ -57,6 +71,35 @@ struct HitInfo {
     vec3 color;
     float reflectivity;
 };
+
+// Function to fetch triangle data from texture
+Triangle getTriangleFromTexture(int triangleIndex) {
+    Triangle tri;
+    
+    // Each triangle uses 3 texels (12 floats total)
+    // Texture width is 4 texels, so each row is one triangle
+    int textureWidth = 4;
+    
+    // Calculate texture coordinates
+    int row = triangleIndex;
+    
+    // Read vertex 0 (first texel, xyz)
+    vec4 texel0 = texelFetch(meshDataTexture, ivec2(0, row), 0);
+    tri.v0 = texel0.xyz;
+    
+    // Read vertex 1 (first texel w component + second texel xy)
+    vec4 texel1 = texelFetch(meshDataTexture, ivec2(1, row), 0);
+    tri.v1 = vec3(texel0.w, texel1.xy);
+    
+    // Read vertex 2 (second texel zw + third texel x)
+    vec4 texel2 = texelFetch(meshDataTexture, ivec2(2, row), 0);
+    tri.v2 = vec3(texel1.zw, texel2.x);
+    
+    // Read normal (third texel yzw)
+    tri.normal = vec3(texel2.yzw);
+    
+    return tri;
+}
 
 // Ray-Sphere intersection
 bool intersectSphere(Ray ray, Object sphere, out HitInfo hitInfo) {
@@ -130,6 +173,94 @@ bool intersectCube(Ray ray, Object cube, out HitInfo hitInfo) {
     return true;
 }
 
+// Ray-Triangle intersection using Möller-Trumbore algorithm
+bool intersectTriangle(Ray ray, Triangle triangle, out HitInfo hitInfo) {
+    const float EPSILON = 0.0000001;
+    
+    vec3 edge1 = triangle.v1 - triangle.v0;
+    vec3 edge2 = triangle.v2 - triangle.v0;
+    vec3 h = cross(ray.direction, edge2);
+    float a = dot(edge1, h);
+    
+    if (abs(a) < EPSILON)
+        return false;    // Ray is parallel to triangle
+    
+    float f = 1.0 / a;
+    vec3 s = ray.origin - triangle.v0;
+    float u = f * dot(s, h);
+    
+    if (u < 0.0 || u > 1.0)
+        return false;
+    
+    vec3 q = cross(s, edge1);
+    float v = f * dot(ray.direction, q);
+    
+    if (v < 0.0 || u + v > 1.0)
+        return false;
+    
+    // At this stage, we can compute t to find out where the intersection point is on the line
+    float t = f * dot(edge2, q);
+    
+    if (t > EPSILON) {
+        hitInfo.hit = true;
+        hitInfo.t = t;
+        hitInfo.position = ray.origin + ray.direction * t;
+        
+        // Calculate the normal
+        if (length(triangle.normal) > 0.0) {
+            // Use the pre-computed normal if available
+            hitInfo.normal = normalize(triangle.normal);
+        } else {
+            // Calculate normal from vertices
+            hitInfo.normal = normalize(cross(edge1, edge2));
+        }
+        
+        // Ensure normal faces the right direction
+        if (dot(ray.direction, hitInfo.normal) > 0.0) {
+            hitInfo.normal = -hitInfo.normal;
+        }
+        
+        return true;
+    }
+    
+    return false;
+}
+
+// Ray-Mesh intersection
+bool intersectMesh(Ray ray, Object meshObj, out HitInfo hitInfo) {
+    bool hit = false;
+    hitInfo.hit = false;
+    hitInfo.t = 1e30; // Large number
+    
+    // Apply mesh object position transformation to ray
+    Ray localRay;
+    localRay.origin = ray.origin - meshObj.position;
+    localRay.direction = ray.direction;
+    
+    // Iterate over all triangles in the mesh
+    for (int i = 0; i < numTriangles; i++) {
+        // Get triangle data from texture
+        Triangle tri = getTriangleFromTexture(i);
+        
+        HitInfo tempHitInfo;
+        if (intersectTriangle(localRay, tri, tempHitInfo)) {
+            if (tempHitInfo.t < hitInfo.t) {
+                hitInfo = tempHitInfo;
+                hitInfo.color = meshObj.color;
+                hitInfo.reflectivity = meshObj.reflectivity;
+                hit = true;
+            }
+        }
+    }
+    
+    // Transform intersection point and normal back to world space
+    if (hit) {
+        hitInfo.position = hitInfo.position + meshObj.position;
+    }
+    
+    return hit;
+}
+
 // Get the closest hit among all objects
 bool traceRay(Ray ray, out HitInfo hitInfo, int skipObjectIndex) {
     hitInfo.hit = false;
@@ -145,6 +276,8 @@ bool traceRay(Ray ray, out HitInfo hitInfo, int skipObjectIndex) {
             hit = intersectSphere(ray, objects[i], tempHitInfo);
         } else if (objects[i].type == OBJECT_TYPE_CUBE) {
             hit = intersectCube(ray, objects[i], tempHitInfo);
+        } else if (objects[i].type == OBJECT_TYPE_MESH && i == meshObjectIndex) {
+            hit = intersectMesh(ray, objects[i], tempHitInfo);
         }
         
         if (hit && tempHitInfo.t < hitInfo.t) {

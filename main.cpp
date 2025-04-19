@@ -42,6 +42,10 @@ bool enableReflections = true;
 int maxBounces = 3;
 float reflectivity = 0.5f;
 
+// Add these new variables to store mesh textures
+GLuint meshDataTexture;
+int meshTextureSize;
+
 // Scene objects for ray tracing
 struct RayTracingObject {
     int type;           // 0 = sphere, 1 = cube, 2 = mesh
@@ -50,6 +54,19 @@ struct RayTracingObject {
     glm::vec3 color;
     float reflectivity;
 };
+
+// Triangle structure for mesh ray tracing
+struct Triangle {
+    glm::vec3 v0;
+    glm::vec3 v1;
+    glm::vec3 v2;
+    glm::vec3 normal;
+};
+
+#define MAX_TRIANGLES 5000
+Triangle meshTriangles[MAX_TRIANGLES];
+int numTriangles = 0;
+int meshObjectIndex = -1;  // Index of mesh object in scene objects array
 
 #define MAX_OBJECTS 16
 RayTracingObject sceneObjects[MAX_OBJECTS];
@@ -111,6 +128,19 @@ void AddCube(glm::vec3 position, glm::vec3 size, glm::vec3 color, float reflecti
     }
 }
 
+// Function to add a mesh to the scene
+void AddMesh(glm::vec3 position, glm::vec3 color, float reflectivity = 0.5f) {
+    if (numObjects < MAX_OBJECTS && meshObjectIndex == -1) {
+        meshObjectIndex = numObjects;
+        sceneObjects[numObjects].type = 2; // Mesh
+        sceneObjects[numObjects].position = position;
+        sceneObjects[numObjects].size = glm::vec3(1.0f); // Not used for mesh
+        sceneObjects[numObjects].color = color;
+        sceneObjects[numObjects].reflectivity = reflectivity;
+        numObjects++;
+    }
+}
+
 // Function to add a light to the scene
 void AddLight(glm::vec3 position, glm::vec3 color, float intensity) {
     if (numLights < MAX_LIGHTS) {
@@ -121,17 +151,166 @@ void AddLight(glm::vec3 position, glm::vec3 color, float intensity) {
     }
 }
 
+// Function to prepare mesh triangles from the OFF model for ray tracing
+void PrepareMeshForRayTracing() {
+    if (!model) return;
+    
+    // Reset triangles
+    numTriangles = 0;
+    
+    // Calculate model center for normalization
+    float centerX = (model->minX + model->maxX) / 2.0f;
+    float centerY = (model->minY + model->maxY) / 2.0f;
+    float centerZ = (model->minZ + model->maxZ) / 2.0f;
+    
+    // For normalization
+    float scale = 2.0f / model->extent;
+    
+    // Count triangles first to determine storage needs
+    for (int i = 0; i < model->numberOfPolygons; i++) {
+        Polygon poly = model->polygons[i];
+        if (poly.noSides >= 3) {
+            numTriangles += (poly.noSides - 2);
+        }
+    }
+    
+    // Limit number of triangles if needed
+    if (numTriangles > MAX_TRIANGLES) {
+        printf("Warning: model has %d triangles, limiting to %d\n", numTriangles, MAX_TRIANGLES);
+        numTriangles = MAX_TRIANGLES;
+    }
+    
+    // Create a data array to store triangle data (9 floats per triangle for vertices + 3 for normal)
+    // Each triangle needs 12 floats: 3 vertices (each with xyz) + 1 normal (xyz)
+    std::vector<float> triangleData;
+    triangleData.reserve(numTriangles * 12);
+    
+    int triangleCount = 0;
+    // Create triangles from the model polygons
+    for (int i = 0; i < model->numberOfPolygons && triangleCount < numTriangles; i++) {
+        Polygon poly = model->polygons[i];
+        
+        // Skip degenerate polygons
+        if (poly.noSides < 3) continue;
+        
+        // Triangle fan triangulation
+        for (int j = 0; j < poly.noSides - 2 && triangleCount < numTriangles; j++) {
+            int v0Idx = poly.v[0];
+            int v1Idx = poly.v[j + 1];
+            int v2Idx = poly.v[j + 2];
+            
+            if (v0Idx >= model->numberOfVertices || 
+                v1Idx >= model->numberOfVertices || 
+                v2Idx >= model->numberOfVertices) continue;
+            
+            // Add normalized vertices to the data array
+            // Vertex 0
+            triangleData.push_back((model->vertices[v0Idx].x - centerX) * scale);
+            triangleData.push_back((model->vertices[v0Idx].y - centerY) * scale);
+            triangleData.push_back((model->vertices[v0Idx].z - centerZ) * scale);
+            
+            // Vertex 1
+            triangleData.push_back((model->vertices[v1Idx].x - centerX) * scale);
+            triangleData.push_back((model->vertices[v1Idx].y - centerY) * scale);
+            triangleData.push_back((model->vertices[v1Idx].z - centerZ) * scale);
+            
+            // Vertex 2
+            triangleData.push_back((model->vertices[v2Idx].x - centerX) * scale);
+            triangleData.push_back((model->vertices[v2Idx].y - centerY) * scale);
+            triangleData.push_back((model->vertices[v2Idx].z - centerZ) * scale);
+            
+            // Calculate face normal
+            glm::vec3 v0(triangleData[triangleCount*12], triangleData[triangleCount*12+1], triangleData[triangleCount*12+2]);
+            glm::vec3 v1(triangleData[triangleCount*12+3], triangleData[triangleCount*12+4], triangleData[triangleCount*12+5]);
+            glm::vec3 v2(triangleData[triangleCount*12+6], triangleData[triangleCount*12+7], triangleData[triangleCount*12+8]);
+            
+            glm::vec3 edge1 = v1 - v0;
+            glm::vec3 edge2 = v2 - v0;
+            glm::vec3 normal = glm::normalize(glm::cross(edge1, edge2));
+            
+            // Add normal to data array
+            triangleData.push_back(normal.x);
+            triangleData.push_back(normal.y);
+            triangleData.push_back(normal.z);
+            
+            triangleCount++;
+        }
+    }
+    
+    // Calculate texture dimensions - must be power of 2 for best compatibility
+    // Each row stores one triangle (12 floats), we'll use a 2D RGBA32F texture
+    // Each RGBA texel stores 4 floats, so we need 3 texels per triangle
+    // Texture width will be 3 (texels per triangle)
+    // Texture height will be numTriangles
+    
+    int textureWidth = 4; // 3 RGBA texels per triangle (12 floats total) + padding
+    int textureHeight = numTriangles;
+    
+    // Round up to nearest power of 2 for height
+    int powerOf2Height = 1;
+    while (powerOf2Height < textureHeight) {
+        powerOf2Height *= 2;
+    }
+    textureHeight = powerOf2Height;
+    
+    meshTextureSize = textureWidth * textureHeight * 4; // * 4 for RGBA
+    
+    // Create and bind a texture to store mesh data
+    glGenTextures(1, &meshDataTexture);
+    glBindTexture(GL_TEXTURE_2D, meshDataTexture);
+    
+    // Set texture parameters
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    
+    // Create empty texture with the right size
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, textureWidth, textureHeight, 
+                0, GL_RGBA, GL_FLOAT, nullptr);
+    
+    // Now fill the texture with our triangle data
+    // We need to convert our array of 12 floats per triangle to an array of RGBA texels
+    std::vector<float> texelData(textureWidth * textureHeight * 4, 0.0f);
+    
+    for (int i = 0; i < triangleCount; i++) {
+        // For each triangle, copy its 12 floats to 3 RGBA texels
+        for (int j = 0; j < 12; j++) {
+            int texelIndex = (i * textureWidth + j / 4) * 4 + (j % 4);
+            texelData[texelIndex] = triangleData[i * 12 + j];
+        }
+    }
+    
+    // Upload the data to the texture
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, textureWidth, textureHeight,
+                  GL_RGBA, GL_FLOAT, texelData.data());
+    
+    // Unbind the texture
+    glBindTexture(GL_TEXTURE_2D, 0);
+    
+    printf("Prepared %d triangles for ray tracing in a %dx%d texture\n", 
+           triangleCount, textureWidth, textureHeight);
+}
+
 // Function to set up a basic scene
 void SetupScene() {
     // Clear any existing objects
     numObjects = 0;
     numLights = 0;
+    meshObjectIndex = -1;
     
     // Add objects to the scene
     AddSphere(glm::vec3(0.0f, 0.0f, 0.0f), 0.5f, glm::vec3(1.0f, 0.2f, 0.2f), 0.7f);
     AddSphere(glm::vec3(1.0f, 0.0f, 1.0f), 0.3f, glm::vec3(0.2f, 0.8f, 0.2f), 0.9f);
     AddCube(glm::vec3(-1.0f, -0.5f, 0.0f), glm::vec3(0.5f), glm::vec3(0.2f, 0.2f, 1.0f), 0.3f);
     AddCube(glm::vec3(0.0f, -1.0f, 0.0f), glm::vec3(5.0f, 0.1f, 5.0f), glm::vec3(0.8f, 0.8f, 0.8f), 0.2f);
+    
+    // Add mesh if model is loaded
+    if (model != NULL) {
+        // Add the mesh to the scene and prepare its triangles
+        AddMesh(glm::vec3(0.0f, 0.5f, 0.0f), glm::vec3(0.8f, 0.5f, 0.2f), 0.4f);
+        PrepareMeshForRayTracing();
+    }
     
     // Add lights
     AddLight(glm::vec3(5.0f, 5.0f, 5.0f), glm::vec3(1.0f, 1.0f, 1.0f), 1.0f);
@@ -318,6 +497,11 @@ static void LoadOffModel() {
     delete[] indices;
     
     numVertices = model->numberOfVertices;
+
+    // After successfully loading the model, prepare it for ray tracing
+    if (model) {
+        PrepareMeshForRayTracing();
+    }
 }
 
 static void CreateVertexBuffer() {
@@ -514,6 +698,20 @@ void RenderRayTracing() {
     // Set ambient light
     GLint ambientLightLoc = glGetUniformLocation(rayTraceProgramID, "ambientLight");
     glUniform3fv(ambientLightLoc, 1, glm::value_ptr(ambientLight));
+    
+    // Bind the mesh data texture
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, meshDataTexture);
+    GLint meshDataTextureLoc = glGetUniformLocation(rayTraceProgramID, "meshDataTexture");
+    glUniform1i(meshDataTextureLoc, 0);
+    
+    // Pass mesh information
+    GLint numTrianglesLoc = glGetUniformLocation(rayTraceProgramID, "numTriangles");
+    GLint meshObjectIndexLoc = glGetUniformLocation(rayTraceProgramID, "meshObjectIndex");
+    GLint meshTextureSizeLoc = glGetUniformLocation(rayTraceProgramID, "meshTextureSize");
+    glUniform1i(numTrianglesLoc, numTriangles);
+    glUniform1i(meshObjectIndexLoc, meshObjectIndex);
+    glUniform1i(meshTextureSizeLoc, meshTextureSize / 4); // Size in texels
     
     // Render the quad
     glBindVertexArray(quadVAO);
